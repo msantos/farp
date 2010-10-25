@@ -87,7 +87,7 @@ init([Dev, Opt]) ->
 
     spawn_link(fun() -> sniff(Socket) end),
 
-    Active = proplists:get_value(active, Opt, false),
+    Active = proplists:get_value(active, Opt, true),
 
     % Send a gratuitous arp spoofing the gateway
     case Active of
@@ -134,7 +134,7 @@ handle_call({arp, Sha, Sip, Tha, Tip}, _From, #state{
     {reply, ok, State};
 
 handle_call(stop, _From, State) ->
-    {stop, normal, ok, State}.
+    {stop, shutdown, ok, State}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -174,7 +174,11 @@ filter([#ether{},
         _Payload]) when Sha == Tha; Sip == Tip ->
     ok;
 filter([#ether{},
-        #arp{sha = Sha, tha = Tha, sip = Sip, tip = Tip},
+        #arp{op = ?ARPOP_REQUEST,
+            sha = Sha,
+            tha = Tha,
+            sip = Sip,
+            tip = Tip},
         _Payload]) ->
     spoof(Sha, Sip, Tha, Tip);
 filter(_) ->
@@ -191,11 +195,8 @@ filter(_) ->
 send_arp(Sha, Sip, Tha, Tip, _) when
     Tha == <<0,0,0,0,0,0>>;
     Tha == <<16#FF,16#FF,16#FF,16#FF,16#FF,16#FF>>;
-    Sha == Tha; Sip == Tip ->
-    ok;
-send_arp(Sha, Sip, Tha, Tip, #state{
-    s = Socket, i = Ifindex
-}) ->
+    Sha == Tha; Sip == Tip -> ok;
+send_arp(Sha, Sip, Tha, Tip, #state{s = Socket, i = Ifindex}) ->
     ok = packet:send(Socket, Ifindex,
         make_arp(?ARPOP_REPLY, Sha, Sip, Tha, Tip)),
 
