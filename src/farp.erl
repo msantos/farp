@@ -174,8 +174,7 @@ filter([#ether{},
         _Payload]) when Sha == Tha; Sip == Tip ->
     ok;
 filter([#ether{},
-        #arp{op = ?ARPOP_REQUEST,
-            sha = Sha,
+        #arp{sha = Sha,
             tha = Tha,
             sip = Sip,
             tip = Tip},
