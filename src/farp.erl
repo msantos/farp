@@ -87,10 +87,10 @@ init([Dev, Opt]) ->
 
     spawn_link(fun() -> sniff(Socket) end),
 
-    Active = proplists:get_value(active, Opt, true),
+    Gratuitous = proplists:get_value(gratuitous, Opt, true),
 
     % Send a gratuitous arp spoofing the gateway
-    case Active of
+    case Gratuitous of
         true ->
             spawn_link(fun() -> gateway_arp(Socket, Ifindex, MAC, GWIP) end);
         false ->
