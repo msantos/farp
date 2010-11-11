@@ -218,7 +218,7 @@ make_arp(Type, Sha, Sip, Tha, Tip) ->
             tip = Tip
         }),
 
-    list_to_binary([Ether, Arp, <<0:128>>]).
+    <<Ether/binary, Arp/binary, 0:128>>.
 
 gratuitous_arp(Sha, Sip) ->
     make_arp(?ARPOP_REPLY, Sha, Sip, ?ETHER_BROADCAST, Sip).
