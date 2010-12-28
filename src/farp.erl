@@ -33,7 +33,7 @@
 
 -define(SERVER, ?MODULE).
 
--include("epcap_net.hrl").
+-include("pkt.hrl").
 
 -export([start/0, start/2, stop/0, spoof/4]).
 -export([start_link/2]).
@@ -161,7 +161,7 @@ sniff(Socket) ->
             timer:sleep(10),
             sniff(Socket);
         {ok, Data} ->
-            P = epcap_net:decapsulate(Data),
+            P = pkt:decapsulate(Data),
             filter(P),
             sniff(Socket);
         Error ->
@@ -204,13 +204,13 @@ send_arp(Sha, Sip, Tha, Tip, #state{s = Socket, i = Ifindex}) ->
 
 
 make_arp(Type, Sha, Sip, Tha, Tip) ->
-    Ether = epcap_net:ether(#ether{
+    Ether = pkt:ether(#ether{
             dhost = Tha,
             shost = Sha,
             type = ?ETH_P_ARP
         }),
 
-    Arp = epcap_net:arp(#arp{
+    Arp = pkt:arp(#arp{
             op = Type,
             sha = Sha,
             sip = Sip,
